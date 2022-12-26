@@ -30,48 +30,110 @@ import threading
 from paho.mqtt import client as mqtt_client
 
 
+
+################################################################################
 class MqttBroker(object):
+   #----------------------------------------------------------------------------
    def __init__(self, ipAddr, port, userName = None, password = None):
       self.ipAddr = ipAddr
       self.port = port
       self.userName = userName
       self.password = password
 
-class MqttAction(object):
-   def __init__(self):
-      self.lock = threading.RLock() # recursive mutex lock
+################################################################################
+class MqttValueTrigger(object):
+   #----------------------------------------------------------------------------
+   def __init__(self, trigger_thresh, compare_trigger_thresh_str, time_thresh = 0, cancel_thresh = None, compare_cancel_thresh_str = None):
+      self.trigger_thresh = trigger_thresh
+      self.compare_trigger_thresh_str = compare_trigger_thresh_str
 
-      self.topic = None
-
-      # What trigger should cause and action
-      self.trigger_value_thresh = False
-      self.trigger_missing_msg_time = False
+      self.cancel_thresh = cancel_thresh
+      self.compare_cancel_thresh_str = compare_cancel_thresh_str
 
       # How long after the initial trigger condition before performing the command
-      self.time_thresh = 0
+      self.time_thresh = time_thresh
 
-      # Parameters used when trigger_value_thresh is true
-      self.trigger_thresh = 0
-      self.compare_trigger_thresh_str = ">" # >, <, >=, <=
-      self.cancel_thresh = None # Hysteresis
-      self.compare_cancel_thresh_str = ">" # >, <, >=, <=
+      # Current state parameters
+      self.trigger_state = False
+      self.trigger_start_time = None
+
+   #----------------------------------------------------------------------------
+   def updateValue(self, floatVal: float):
+      triggered = False
+      canceled = False
+
+      if (self.compare_trigger_thresh_str == ">"  and floatVal > self.trigger_thresh) or \
+         (self.compare_trigger_thresh_str == "<"  and floatVal < self.trigger_thresh) or \
+         (self.compare_trigger_thresh_str == ">=" and floatVal >= self.trigger_thresh) or \
+         (self.compare_trigger_thresh_str == "<=" and floatVal <= self.trigger_thresh):
+         triggered = True
+      elif (self.cancel_thresh != None) and (
+         (self.compare_cancel_thresh_str == ">"  and floatVal > self.cancel_thresh) or \
+         (self.compare_cancel_thresh_str == "<"  and floatVal < self.cancel_thresh) or \
+         (self.compare_cancel_thresh_str == ">=" and floatVal >= self.cancel_thresh) or \
+         (self.compare_cancel_thresh_str == "<=" and floatVal <= self.cancel_thresh) ):
+         canceled = True
+
+      # Update member variables.
+      if triggered:
+         self.trigger_state = True
+         self.trigger_start_time = time.time()
+      elif canceled:
+         self.trigger_state = False
+
+   #----------------------------------------------------------------------------
+   def checkRunCommand(self, nowTime):
+      retVal = False
+      if self.trigger_state and (nowTime - self.trigger_start_time) > self.time_thresh:
+         retVal = True
+         if self.cancel_thresh == None:
+            # Just acted on a trigger that has no cancel threshold (i.e. no way to un-trigger). Un-trigger now.
+            self.trigger_state = False
+      return retVal
+
+
+################################################################################
+class MqttTimeoutTrigger(object):
+   #----------------------------------------------------------------------------
+   def __init__(self, timeout_time):
+      self.timeout_time = timeout_time
+
+      # Start Triggered.
+      self.trigger_state = True
+      self.trigger_start_time = time.time()
+
+   #----------------------------------------------------------------------------
+   def updateValue(self, floatVal: float):
+      self.trigger_start_time = time.time() # Reset the trigger time.
+
+   #----------------------------------------------------------------------------
+   def checkRunCommand(self, nowTime):
+      retVal = False
+      if self.trigger_state and (nowTime - self.trigger_start_time) > self.timeout_time:
+         retVal = True
+            
+         self.trigger_state = False # Only one trigger for now.
+      return retVal
+
+
+################################################################################
+class MqttAction(object):
+   #----------------------------------------------------------------------------
+   def __init__(self, topic, trigger):
+      self.lock = threading.RLock() # recursive mutex lock
+
+      self.topic = topic
+
+      # Trigger object.
+      self.trigger_object = trigger
 
       # Info about the command to run when the trigger has happened for long enough
       self.command = None
 
-      self.trigger_state = False
-      self.trigger_start_time = None
-
-   # Since the constructor doesn't have enough info to fill all the member variables 
-   # in, this can be called to start things off after all the member variables have 
-   # been manually filled in.
-   def start(self):
-      if self.trigger_missing_msg_time:
-         self.trigger_state = True
-         self.trigger_start_time = time.time()
-
-   
+   #----------------------------------------------------------------------------
+   # Run this when a new MQTT value has come in.
    def newValue(self, newValStr: str):
+      # Convert to float
       floatVal = 0.0
       try:
          floatVal = float(newValStr)
@@ -81,51 +143,28 @@ class MqttAction(object):
          elif newValStr.lower() == "false":
             floatVal = 0.0
          else:
+            print("Failed to convert '" + newValStr + "' to string.")
             return # TODO throw exception?
       
-      self.checkForTriggers(floatVal)
+      # Check if the new value changes anything.
+      with self.lock: # Lock the mutex
+         self.trigger_object.updateValue(floatVal)
+
+      # Check if any actions need to occur.
       self.checkForTriggerAction()
 
-   def checkForTriggers(self, floatVal: float):
-      with self.lock: # Lock the mutex
-         triggered = False
-         canceled = False
-         if self.trigger_value_thresh:
-            if (self.compare_trigger_thresh_str == ">"  and floatVal > self.trigger_thresh) or \
-               (self.compare_trigger_thresh_str == "<"  and floatVal < self.trigger_thresh) or \
-               (self.compare_trigger_thresh_str == ">=" and floatVal >= self.trigger_thresh) or \
-               (self.compare_trigger_thresh_str == "<=" and floatVal <= self.trigger_thresh):
-               triggered = True
-            elif (self.cancel_thresh != None) and (
-               (self.compare_cancel_thresh_str == ">"  and floatVal > self.cancel_thresh) or \
-               (self.compare_cancel_thresh_str == "<"  and floatVal < self.cancel_thresh) or \
-               (self.compare_cancel_thresh_str == ">=" and floatVal >= self.cancel_thresh) or \
-               (self.compare_cancel_thresh_str == "<=" and floatVal <= self.cancel_thresh) ):
-               canceled = True
-
-         # Update member variables.
-         if triggered:
-            self.trigger_state = True
-            self.trigger_start_time = time.time()
-         elif canceled:
-            self.trigger_state = False
-
+   #----------------------------------------------------------------------------
    def checkForTriggerAction(self):
       with self.lock: # Lock the mutex
+         performAction = False
          nowTime = time.time()
 
-         if self.trigger_state and (nowTime - self.trigger_start_time) > self.time_thresh:
-            # Perform command
-            print("Performing Command")
-         
-            if self.trigger_value_thresh:
-               if self.cancel_thresh == None:
-                  # Just acted on a trigger that has no cancel threshold (i.e. no way to un-trigger). Un-trigger now.
-                  self.trigger_state = False
-            elif self.trigger_missing_msg_time:
-               self.trigger_state = False
-               
+         # Check if the conditions are right to run the command.
+         performAction = self.trigger_object.checkRunCommand(nowTime)
 
+         if performAction:
+            print("Run Command!")
+               
 
 
 ################################################################################
@@ -168,14 +207,7 @@ if __name__ == "__main__":
    broker = MqttBroker("127.0.0.1", 1883)
 
    actions = []
-   action = MqttAction()
-   action.topic = "test/123"
-   #action.trigger_value_thresh = True
-   action.trigger_missing_msg_time = True
-   action.trigger_thresh = 10
-   action.time_thresh = 10
-   action.start()
-   actions.append(action)
+   actions.append( MqttAction("test/123", MqttTimeoutTrigger(10)) )
 
 
    # Connect to MQTT Broker
